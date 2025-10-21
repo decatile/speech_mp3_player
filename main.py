@@ -16,17 +16,14 @@ except ImportError:
     print('Failed to load generated file for main window. You may need to generate it with "./manage.ps1 compile-ui".')
     exit(1)
 
-Fraction = float
-QUEUE_END = b'\0'
+QUEUE_END = bytes()
 
 
 class Player:
-    def __init__(
-        self,
-        filepath: str,
-        on_next: Callable[[Fraction], None],
-    ):
-        self._data, self._rate = librosa.load(filepath)
+    def __init__(self, filepath: str, on_next: Callable[[], None]):
+        self._data, rate = librosa.load(filepath)
+        assert isinstance(rate, int)
+        self._rate = rate
         self.duration_seconds = librosa.get_duration(
             y=self._data,
             sr=self._rate
@@ -53,7 +50,7 @@ class Player:
             chunk = self._data[self._data_pointer:self._data_pointer+chunk_size]
             outdata[:chunk_size, 0] = chunk
             self._data_pointer += chunk_size
-            self._on_next(self.fraction)
+            self._on_next()
 
     def play(self):
         if self.end:
@@ -71,7 +68,7 @@ class Player:
         assert value >= 0
         with self._data_pointer_lock:
             self._data_pointer = min(value * self._rate, len(self._data))
-            self._on_next(self.fraction)
+            self._on_next()
 
     def add_seconds(self, value: int):
         with self._data_pointer_lock:
@@ -80,7 +77,7 @@ class Player:
                 self._data_pointer = min(self._data_pointer, len(self._data))
             else:
                 self._data_pointer = max(self._data_pointer, 0)
-            self._on_next(self.fraction)
+            self._on_next()
 
     @property
     def playing(self):
@@ -143,13 +140,13 @@ class MainWindow(QMainWindow):
             self.on_main_back_button_clicked
         )
         device_info = cast(dict, sd.query_devices(sd.default.device[0]))
-        samplerate = device_info["default_samplerate"]
+        samplerate = device_info['default_samplerate']
         self.input_stream_queue = Queue()
         self.input_stream = sd.RawInputStream(
             samplerate=samplerate,
             blocksize=8000,
             device=sd.default.device[0],
-            dtype="int16",
+            dtype='int16',
             channels=1,
             callback=self.on_chunk_recorded
         )
@@ -163,8 +160,8 @@ class MainWindow(QMainWindow):
 
         def thread():
             try:
-                self.player = Player(path, self.on_next)
-            except Exception as e:
+                self.player = Player(path, self.render_timestamp_label)
+            except:
                 self.ui.fileSelectionButton.setEnabled(True)
                 self.ui.fileSelectionLabel.setStyleSheet('color: red')
                 self.ui.fileSelectionLabel.setText('Invalid file!')
@@ -180,11 +177,11 @@ class MainWindow(QMainWindow):
         self.ui.stackedWidget.setCurrentIndex(1)
 
         def thread():
-            self.on_next(self.player.fraction)
+            self.render_timestamp_label()
             self.input_stream.start()
             while True:
                 data = self.input_stream_queue.get()
-                if data == QUEUE_END:
+                if data is QUEUE_END:
                     self.kaldi.Reset()
                     return
                 if self.kaldi.AcceptWaveform(data):
@@ -229,13 +226,14 @@ class MainWindow(QMainWindow):
     def on_chunk_recorded(self, indata, frames, time, status):
         self.input_stream_queue.put(bytes(indata))
 
-    def on_next(self, fraction: Fraction):
-        total_minutes, total_seconds = divmod(
-            int(self.player.duration_seconds),
-            60
-        )
+    def render_timestamp_label(self):
+        fraction = self.player.fraction
         minutes, seconds = divmod(
             int(self.player.duration_seconds * fraction),
+            60
+        )
+        total_minutes, total_seconds = divmod(
+            int(self.player.duration_seconds),
             60
         )
         self.ui.mainStampLabel.setText(
