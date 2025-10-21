@@ -77,6 +77,7 @@ class MainWindow(QMainWindow):
     def on_file_selection_dialog_accepted(self):
         file = self.file_selection_dialog.selectedFiles()[0]
         self.player.setSource(file)
+        self.player.mediaStatusChanged.connect(self.on_media_status_changed)
         self.ui.fileSelectionLabel.setText(f'File is "{Path(file).name}".')
         self.ui.fileGoButton.setEnabled(True)
 
@@ -127,6 +128,10 @@ class MainWindow(QMainWindow):
         elif text == 'экран':
             self.fullscreen = not self.fullscreen
             self.ui.player.setFullScreen(self.fullscreen)
+    
+    def on_media_status_changed(self, mediaStatus: QMediaPlayer.MediaStatus):
+        if mediaStatus == QMediaPlayer.MediaStatus.LoadedMedia:
+            self.render_timestamp_label()
 
     def render_timestamp_label(self):
         minutes, seconds = divmod(
