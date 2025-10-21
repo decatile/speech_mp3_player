@@ -1,12 +1,12 @@
 from pathlib import Path
 from queue import Queue
-from threading import Lock, Thread
-from typing import Callable, cast
+from threading import Thread
+from typing import cast
 from vosk import KaldiRecognizer, Model
-from PySide6.QtWidgets import QMainWindow, QApplication, QFileDialog, QInputDialog
+from PySide6.QtCore import QTimer, QThread, SIGNAL, SLOT, Signal, Slot
+from PySide6.QtWidgets import QMainWindow, QApplication, QFileDialog
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 import sys
-import re
-import librosa
 import json
 import sounddevice as sd
 
@@ -15,79 +15,6 @@ try:
 except ImportError:
     print('Failed to load generated file for main window. You may need to generate it with "./manage.ps1 compile-ui".')
     exit(1)
-
-QUEUE_END = bytes()
-
-
-class Player:
-    def __init__(self, filepath: str, on_next: Callable[[], None]):
-        self._data, rate = librosa.load(filepath)
-        assert isinstance(rate, int)
-        self._rate = rate
-        self.duration_seconds = librosa.get_duration(
-            y=self._data,
-            sr=self._rate
-        )
-        self._output_stream = sd.OutputStream(
-            samplerate=self._rate,
-            device=sd.default.device[1],
-            channels=1,
-            callback=self._on_chunk_requested
-        )
-        self._on_next = on_next
-        self._finished = False
-        self._data_pointer = 0
-        self._lock = Lock()
-
-    def _on_chunk_requested(self, outdata, frames, time, status):
-        with self._lock:
-            if self._end:
-                return
-            chunk_size = min(
-                len(outdata[:, 0]),
-                len(self._data) - self._data_pointer
-            )
-            chunk = self._data[self._data_pointer:self._data_pointer+chunk_size]
-            outdata[:chunk_size, 0] = chunk
-            self._data_pointer += chunk_size
-            self._on_next()
-
-    def play(self):
-        with self._lock:
-            if self._end:
-                if self._output_stream.active:
-                    self._output_stream.stop()
-                self._data_pointer = 0
-            if not self._output_stream.active:
-                self._output_stream.start()
-
-    def stop(self):
-        with self._lock:
-            if self._output_stream.active:
-                self._output_stream.stop()
-
-    def set_seconds(self, value: int):
-        assert value >= 0
-        with self._lock:
-            self._data_pointer = min(value * self._rate, len(self._data))
-            self._on_next()
-
-    def add_seconds(self, value: int):
-        with self._lock:
-            self._data_pointer += value * self._rate
-            if value > 0:
-                self._data_pointer = min(self._data_pointer, len(self._data))
-            else:
-                self._data_pointer = max(self._data_pointer, 0)
-            self._on_next()
-
-    @property
-    def _end(self):
-        return self._data_pointer >= len(self._data)
-
-    @property
-    def fraction(self):
-        return self._data_pointer / len(self._data)
 
 
 class MainWindow(QMainWindow):
@@ -103,7 +30,7 @@ class MainWindow(QMainWindow):
         self.file_selection_dialog.setFileMode(
             QFileDialog.FileMode.ExistingFile
         )
-        self.file_selection_dialog.setNameFilter('*.mp3')
+        self.file_selection_dialog.setNameFilter('*.mp4')
         self.file_selection_dialog.accepted.connect(
             self.on_file_selection_dialog_accepted
         )
@@ -115,18 +42,17 @@ class MainWindow(QMainWindow):
         )
 
     def setup_main_page(self):
-        self.main_jump_dialog = QInputDialog(self)
-        self.main_jump_dialog.accepted.connect(
-            self.on_main_jump_dialog_accepted
-        )
+        self.fullscreen = False
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.render_timestamp_label)
+        self.player = QMediaPlayer(self)
+        self.player.setVideoOutput(self.ui.player)
+        self.player.setAudioOutput(QAudioOutput(self))
         self.ui.mainPlayButton.clicked.connect(
             self.on_main_play_action_triggered
         )
         self.ui.mainStopButton.clicked.connect(
             self.on_main_stop_action_triggered
-        )
-        self.ui.mainJumpButton.clicked.connect(
-            self.main_jump_dialog.exec
         )
         self.ui.mainLeftButton.clicked.connect(
             self.on_main_backward_action_triggered
@@ -134,9 +60,7 @@ class MainWindow(QMainWindow):
         self.ui.mainRightButton.clicked.connect(
             self.on_main_forward_action_triggered
         )
-        self.ui.mainBackButton.clicked.connect(
-            self.on_main_back_button_clicked
-        )
+        self.text_recorded.connect(self.on_text_recorded)
         device_info = cast(dict, sd.query_devices(sd.default.device[0]))
         samplerate = device_info['default_samplerate']
         self.input_stream_queue = Queue()
@@ -151,92 +75,72 @@ class MainWindow(QMainWindow):
         self.kaldi = KaldiRecognizer(Model(lang='ru'), samplerate)
 
     def on_file_selection_dialog_accepted(self):
-        path = self.file_selection_dialog.selectedFiles()[0]
-        self.ui.fileSelectionLabel.setText('Processing...')
-        self.ui.fileSelectionButton.setEnabled(False)
-        self.player = cast(Player, None)
-
-        def thread():
-            try:
-                self.player = Player(path, self.render_timestamp_label)
-            except:
-                self.ui.fileSelectionButton.setEnabled(True)
-                self.ui.fileSelectionLabel.setStyleSheet('color: red')
-                self.ui.fileSelectionLabel.setText('Invalid file!')
-                return
-            self.ui.fileSelectionButton.setEnabled(True)
-            self.ui.fileSelectionLabel.setStyleSheet('')
-            self.ui.fileSelectionLabel.setText(f'File is {Path(path).name}.')
-            self.ui.fileGoButton.setEnabled(True)
-
-        Thread(target=thread, daemon=True).start()
+        file = self.file_selection_dialog.selectedFiles()[0]
+        self.player.setSource(file)
+        self.ui.fileSelectionLabel.setText(f'File is "{Path(file).name}".')
+        self.ui.fileGoButton.setEnabled(True)
 
     def on_file_go_button_clicked(self):
+        self.timer.start(500)
         self.ui.stackedWidget.setCurrentIndex(1)
 
         def thread():
-            self.render_timestamp_label()
             self.input_stream.start()
             while True:
                 data = self.input_stream_queue.get()
-                if data is QUEUE_END:
-                    self.kaldi.Reset()
-                    return
                 if self.kaldi.AcceptWaveform(data):
                     text = json.loads(self.kaldi.Result())['text']
-                    if text == 'пуск':
-                        self.on_main_play_action_triggered()
-                    elif text == 'стоп':
-                        self.on_main_stop_action_triggered()
-                    elif text == 'вперёд':
-                        self.on_main_forward_action_triggered()
-                    elif text == 'назад':
-                        self.on_main_backward_action_triggered()
+                    self.text_recorded.emit(text)
 
         Thread(target=thread, daemon=True).start()
-
-    def on_main_jump_dialog_accepted(self):
-        value = self.main_jump_dialog.textValue()
-        m = re.fullmatch(r'(\d+):([0-5]?\d)', value)
-        if m is None:
-            return
-        seconds = int(m.group(1)) * 60 + int(m.group(2))
-        self.player.set_seconds(seconds)
 
     def on_main_play_action_triggered(self):
         self.player.play()
 
     def on_main_stop_action_triggered(self):
-        self.player.stop()
+        self.player.pause()
 
     def on_main_backward_action_triggered(self):
-        self.player.add_seconds(-10)
+        self.player.pause()
+        self.player.setPosition(self.player.position() - 10_000)
+        self.player.play()
 
     def on_main_forward_action_triggered(self):
-        self.player.add_seconds(10)
-
-    def on_main_back_button_clicked(self):
-        self.player.stop()
-        self.input_stream.abort()
-        self.input_stream_queue.put(QUEUE_END)
-        self.ui.stackedWidget.setCurrentIndex(0)
+        self.player.pause()
+        self.player.setPosition(self.player.position() + 10_000)
+        self.player.play()
 
     def on_chunk_recorded(self, indata, frames, time, status):
         self.input_stream_queue.put(bytes(indata))
 
+    text_recorded = Signal(str)
+
+    def on_text_recorded(self, text):
+        if text == 'пуск':
+            self.on_main_play_action_triggered()
+        elif text == 'стоп':
+            self.on_main_stop_action_triggered()
+        elif text == 'вперёд':
+            self.on_main_forward_action_triggered()
+        elif text == 'назад':
+            self.on_main_backward_action_triggered()
+        elif text == 'экран':
+            self.fullscreen = not self.fullscreen
+            self.ui.player.setFullScreen(self.fullscreen)
+
     def render_timestamp_label(self):
-        fraction = self.player.fraction
         minutes, seconds = divmod(
-            int(self.player.duration_seconds * fraction),
+            int(self.player.position() / 1000),
             60
         )
         total_minutes, total_seconds = divmod(
-            int(self.player.duration_seconds),
+            int(self.player.duration() / 1000),
             60
         )
         self.ui.mainStampLabel.setText(
             f'{minutes}:{seconds:02d}/{total_minutes}:{total_seconds:02d}'
         )
+        fraction = self.player.position() / self.player.duration()
         self.ui.mainProgressBar.setValue(int(fraction * 100))
 
 
