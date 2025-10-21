@@ -37,12 +37,12 @@ class Player:
         self._on_next = on_next
         self._finished = False
         self._data_pointer = 0
-        self._data_pointer_lock = Lock()
+        self._lock = Lock()
 
     def _on_chunk_requested(self, outdata, frames, time, status):
-        if self.end:
-            return
-        with self._data_pointer_lock:
+        with self._lock:
+            if self._end:
+                return
             chunk_size = min(
                 len(outdata[:, 0]),
                 len(self._data) - self._data_pointer
@@ -53,25 +53,27 @@ class Player:
             self._on_next()
 
     def play(self):
-        if self.end:
-            self._output_stream.abort()
-            with self._data_pointer_lock:
+        with self._lock:
+            if self._end:
+                if self._output_stream.active:
+                    self._output_stream.stop()
                 self._data_pointer = 0
-        if not self.playing:
-            self._output_stream.start()
+            if not self._output_stream.active:
+                self._output_stream.start()
 
     def stop(self):
-        if self.playing:
-            self._output_stream.abort()
+        with self._lock:
+            if self._output_stream.active:
+                self._output_stream.stop()
 
     def set_seconds(self, value: int):
         assert value >= 0
-        with self._data_pointer_lock:
+        with self._lock:
             self._data_pointer = min(value * self._rate, len(self._data))
             self._on_next()
 
     def add_seconds(self, value: int):
-        with self._data_pointer_lock:
+        with self._lock:
             self._data_pointer += value * self._rate
             if value > 0:
                 self._data_pointer = min(self._data_pointer, len(self._data))
@@ -80,11 +82,7 @@ class Player:
             self._on_next()
 
     @property
-    def playing(self):
-        return self._output_stream.active
-
-    @property
-    def end(self):
+    def _end(self):
         return self._data_pointer >= len(self._data)
 
     @property
